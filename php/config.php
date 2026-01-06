@@ -21,7 +21,7 @@ return [
     'pg_port' => (int)env('PGPORT', '5432'),
     'pg_user' => env('PGUSER', 'xxx'),
     'pg_pass' => env('PGPASSWORD', 'xxx'),
-    'pg_db'   => env('PGDATABASE', 'maildb'),
+    'pg_db'   => env('PGDATABASE', 'xx'),
 
     // PDO options
     'pdo_options' => [
