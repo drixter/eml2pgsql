@@ -3,18 +3,25 @@ declare(strict_types=1);
 require_once __DIR__ . '/db.php';
 
 /**
- * Minimal mail viewer for PostgreSQL (schema: mail.emails & mail.attachments).
+ * Mail Viewer with Full-Text Search (FTS)
+ * Schema: mail.emails (includes: fts tsvector), mail.attachments
+ *
  * Routes (?action=...):
- *  - list (default): list emails with search/pagination
+ *  - list (default): list emails, FTS with ranking + pagination
  *  - view&id=EMAIL_ID: email details + attachments
- *  - download_attachment&id=ATTACH_ID: download attachment
- *  - cid&email_id=EMAIL_ID&cid=CID: serve inline CID resources
+ *  - download_attachment&id=ATTACH_ID: download attachment (BYTEA)
+ *  - cid&email_id=EMAIL_ID&cid=CID: serve inline CID resources (images, etc.)
  */
 
-function h(?string $s): string { return htmlspecialchars($s ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
-function param(string $name, ?string $default = null): ?string { return isset($_GET[$name]) ? (string)$_GET[$name] : $default; }
-function postv(string $name, ?string $default = null): ?string { return isset($_POST[$name]) ? (string)$_POST[$name] : $default; }
-
+function h(?string $s): string {
+    return htmlspecialchars($s ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+function param(string $name, ?string $default = null): ?string {
+    return isset($_GET[$name]) ? (string)$_GET[$name] : $default;
+}
+function postv(string $name, ?string $default = null): ?string {
+    return isset($_POST[$name]) ? (string)$_POST[$name] : $default;
+}
 function normalize_cid(?string $cid): ?string {
     if ($cid === null) return null;
     $cid = trim($cid);
@@ -50,66 +57,154 @@ function header_html(string $title): void {
         .footer{margin-top:40px;color:#666;font-size:12px;}
     </style></head><body><header><strong>Mail Viewer</strong></header><main>';
 }
-function footer_html(): void { echo '<div class="footer">Mail Viewer PHP + PostgreSQL</div></main></body></html>'; }
+function footer_html(): void {
+    echo '<div class="footer">Mail Viewer • PHP + PostgreSQL (FTS)</div></main></body></html>';
+}
 
+/**
+ * LIST: FTS search with ranking and pagination
+ */
 function action_list(): void {
     $pdo = db();
+
     $q = trim((string)param('q', ''));
     $page = max(1, (int)param('page', '1'));
     $pageSize = max(1, min(100, (int)param('page_size', '50')));
     $offset = ($page - 1) * $pageSize;
 
-    $where = [];
-    $params = [];
-    if ($q !== '') {
-        $where[] = "(subject ILIKE :q OR from_addr ILIKE :q OR to_addrs ILIKE :q OR text_body ILIKE :q)";
-        $params[':q'] = '%' . $q . '%';
+    $useFts = ($q !== '');
+    $showSnippet = (param('snippet', '0') === '1');
+    $advanced = (param('advanced', '0') === '1'); // to_tsquery when enabled
+
+    if ($useFts) {
+        if ($advanced) {
+            // Count with to_tsquery (expects tsquery syntax: OR '|', adjacency '<->', prefix ':*')
+            $stmt = $pdo->prepare("SELECT COUNT(*) AS c
+                                   FROM mail.emails
+                                   WHERE fts @@ to_tsquery('simple', :q)");
+            $stmt->bindValue(':q', $q);
+            $stmt->execute();
+            $total = (int)$stmt->fetch()['c'];
+
+            // Page data with rank (and optional snippet)
+            if ($showSnippet) {
+                $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id,
+                               ts_rank(fts, to_tsquery('simple', :q)) AS rank,
+                               ts_headline('simple', text_body, to_tsquery('simple', :q),
+                                           'HighlightAll=true, StartSel=<mark>, StopSel=</mark>') AS snippet
+                        FROM mail.emails
+                        WHERE fts @@ to_tsquery('simple', :q)
+                        ORDER BY rank DESC, sent_at_utc DESC NULLS LAST
+                        LIMIT :limit OFFSET :offset";
+            } else {
+                $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id,
+                               ts_rank(fts, to_tsquery('simple', :q)) AS rank
+                        FROM mail.emails
+                        WHERE fts @@ to_tsquery('simple', :q)
+                        ORDER BY rank DESC, sent_at_utc DESC NULLS LAST
+                        LIMIT :limit OFFSET :offset";
+            }
+            $stmt = $pdo->prepare($sql);
+            $stmt->bindValue(':q', $q);
+        } else {
+            // Count with plainto_tsquery (safe for natural text)
+            $stmt = $pdo->prepare("SELECT COUNT(*) AS c
+                                   FROM mail.emails
+                                   WHERE fts @@ plainto_tsquery('simple', :q)");
+            $stmt->bindValue(':q', $q);
+            $stmt->execute();
+            $total = (int)$stmt->fetch()['c'];
+
+            // Page data with rank (and optional snippet)
+            if ($showSnippet) {
+                $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id,
+                               ts_rank(fts, plainto_tsquery('simple', :q)) AS rank,
+                               ts_headline('simple', text_body, plainto_tsquery('simple', :q),
+                                           'HighlightAll=true, StartSel=<mark>, StopSel=</mark>') AS snippet
+                        FROM mail.emails
+                        WHERE fts @@ plainto_tsquery('simple', :q)
+                        ORDER BY rank DESC, sent_at_utc DESC NULLS LAST
+                        LIMIT :limit OFFSET :offset";
+            } else {
+                $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id,
+                               ts_rank(fts, plainto_tsquery('simple', :q)) AS rank
+                        FROM mail.emails
+                        WHERE fts @@ plainto_tsquery('simple', :q)
+                        ORDER BY rank DESC, sent_at_utc DESC NULLS LAST
+                        LIMIT :limit OFFSET :offset";
+            }
+            $stmt = $pdo->prepare($sql);
+            $stmt->bindValue(':q', $q);
+        }
+    } else {
+        // No query: show latest emails
+        $stmt = $pdo->query("SELECT COUNT(*) AS c FROM mail.emails");
+        $total = (int)$stmt->fetch()['c'];
+
+        $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id
+                FROM mail.emails
+                ORDER BY sent_at_utc DESC NULLS LAST, id DESC
+                LIMIT :limit OFFSET :offset";
+        $stmt = $pdo->prepare($sql);
     }
-    $whereSql = count($where) ? ('WHERE ' . implode(' AND ', $where)) : '';
 
-    $stmt = $pdo->prepare("SELECT COUNT(*) AS c FROM mail.emails $whereSql");
-    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
-    $stmt->execute();
-    $total = (int)$stmt->fetch()['c'];
-
-    $sql = "SELECT id, subject, from_addr, to_addrs, sent_at_utc, message_id
-            FROM mail.emails
-            $whereSql
-            ORDER BY sent_at_utc DESC NULLS LAST, id DESC
-            LIMIT :limit OFFSET :offset";
-    $stmt = $pdo->prepare($sql);
-    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
+    // Bind common pagination params
     $stmt->bindValue(':limit', $pageSize, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();
     $rows = $stmt->fetchAll();
 
     header_html('Mail Viewer');
-    echo '<form class="toolbar" method="get" action="index.php">';
+
+    // Toolbar + Search form
+    echo '<div class="toolbar">';
+    echo '<form method="get" action="index.php">';
     echo '<input type="hidden" name="action" value="list">';
-    echo '<input type="text" name="q" value="' . h($q) . '" placeholder="Search subject, from, to, text...">';
-    echo '<button class="btn btn-primary" type="submit">Search</button>';
+    echo '<input type="text" name="q" value="' . h($q) . '" placeholder="Search (FTS): subject, addresses, body...">';
+    echo '<label><input type="checkbox" name="snippet" value="1"' . ($showSnippet ? ' checked' : '') . '> show snippet</label>';
+    echo '<label><input type="checkbox" name="advanced" value="1"' . ($advanced ? ' checked' : '') . '> advanced (to_tsquery)</label>';
+    echo '<button class="btn btn-primary" type="submit">Search</button> ';
+    echo '<a class="btn" href="index.php?action=list">Clear</a> ';
+    echo ($useFts
+        ? '<span class="pill">FTS: ON (' . ($advanced ? 'to_tsquery' : 'plainto_tsquery') . ')</span>'
+        : '<span class="pill">FTS: OFF</span>');
     echo '<span class="pill">Total: ' . h((string)$total) . '</span>';
     echo '</form>';
+    echo '</div>';
 
+    // Results table
     echo '<table>';
-    echo '<tr><th class="nowrap">Date</th><th>Subject</th><th>From</th><th>To</th></tr>';
+    echo '<tr><th class="nowrap">Date</th><th>Subject</th><th>From</th><th>To</th>' . ($useFts ? '<th class="nowrap">Rank</th>' : '') . '</tr>';
     foreach ($rows as $r) {
         $date = $r['sent_at_utc'] ?? '';
+        $rank = $useFts ? (isset($r['rank']) ? sprintf('%.4f', (float)$r['rank']) : '') : '';
         echo '<tr>';
         echo '<td class="nowrap">' . h($date) . '</td>';
-        echo '<td><a href="index.php?action=view&id=' . h((string)$r['id']) . '">' . h($r['subject']) . '</a> ' .
+        echo '<td><a href="index.php?action=view&id=' . h((string)$r['id']) . '">' . h($r['subject'] ?? '(no subject)') . '</a> ' .
              ($r['message_id'] ? '<span class="pill">MsgID</span>' : '') . '</td>';
         echo '<td>' . h($r['from_addr']) . '</td>';
         echo '<td>' . h($r['to_addrs']) . '</td>';
+        if ($useFts) echo '<td class="nowrap"><code>' . h($rank) . '</code></td>';
         echo '</tr>';
+
+        // Optional snippet row
+        if ($useFts && $showSnippet && isset($r['snippet']) && is_string($r['snippet']) && $r['snippet'] !== '') {
+            echo '<tr><td colspan="' . ($useFts ? '5' : '4') . '">';
+            echo '<div class="muted">Snippet:</div>';
+            // ts_headline returns marked text, safe to render as HTML here
+            echo '<div class="card">' . $r['snippet'] . '</div>';
+            echo '</td></tr>';
+        }
     }
     echo '</table>';
 
+    // Pagination
     $maxPage = max(1, (int)ceil($total / $pageSize));
     $prevPage = max(1, $page - 1);
     $nextPage = min($maxPage, $page + 1);
-    $base = 'index.php?action=list&q=' . urlencode($q) . '&page_size=' . $pageSize;
+    $base = 'index.php?action=list&q=' . urlencode($q) . '&page_size=' . $pageSize
+          . '&snippet=' . ($showSnippet ? '1' : '0') . '&advanced=' . ($advanced ? '1' : '0');
+
     echo '<div class="toolbar">';
     echo '<a class="btn" href="' . $base . '&page=1">First</a>';
     echo '<a class="btn" href="' . $base . '&page=' . $prevPage . '">Prev</a>';
@@ -121,6 +216,9 @@ function action_list(): void {
     footer_html();
 }
 
+/**
+ * VIEW: Single email + attachments and CID rewriting for inline images
+ */
 function action_view(): void {
     $pdo = db();
     $id = (int)param('id', '0');
@@ -138,6 +236,7 @@ function action_view(): void {
     $stmt->execute();
     $attachments = $stmt->fetchAll();
 
+    // HTML body CID rewriting: cid:... -> route
     $htmlBody = $email['html_body'] ?? null;
     if (is_string($htmlBody) && $htmlBody !== '') {
         $cidMap = [];
@@ -222,12 +321,16 @@ function action_view(): void {
     footer_html();
 }
 
+/**
+ * DOWNLOAD: Attachment by id
+ */
 function action_download_attachment(): void {
     $pdo = db();
     $id = (int)param('id', '0');
     if ($id <= 0) { http_response_code(400); echo 'Invalid attachment id'; return; }
 
-    $stmt = $pdo->prepare("SELECT filename, content_type, encode(content, 'base64') AS b64 FROM mail.attachments WHERE id = :id");
+    $stmt = $pdo->prepare("SELECT filename, content_type, encode(content, 'base64') AS b64
+                           FROM mail.attachments WHERE id = :id");
     $stmt->bindValue(':id', $id, PDO::PARAM_INT);
     $stmt->execute();
     $row = $stmt->fetch();
@@ -245,6 +348,9 @@ function action_download_attachment(): void {
     echo $data;
 }
 
+/**
+ * CID: Serve inline image/resource referenced via cid:
+ */
 function action_cid(): void {
     $pdo = db();
     $emailId = (int)param('email_id', '0');
@@ -276,6 +382,7 @@ function action_cid(): void {
     echo $data;
 }
 
+// Router
 $action = param('action', 'list');
 switch ($action) {
     case 'list': action_list(); break;
